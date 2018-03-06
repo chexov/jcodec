@@ -45,6 +45,7 @@ public class H264Encoder extends VideoEncoder {
 
     // private static final int QP = 20;
     private static final int KEY_INTERVAL_DEFAULT = 25;
+    private static final int MOTION_SEARCH_RANGE_DEFAULT = 16;
 
     public static H264Encoder createH264Encoder() {
         return new H264Encoder(new DumbRateControl());
@@ -56,6 +57,7 @@ public class H264Encoder extends VideoEncoder {
     private RateControl rc;
     private int frameNumber;
     private int keyInterval;
+    private int motionSearchRange;
 
     private int maxPOC;
 
@@ -78,6 +80,7 @@ public class H264Encoder extends VideoEncoder {
     public H264Encoder(RateControl rc) {
         this.rc = rc;
         this.keyInterval = KEY_INTERVAL_DEFAULT;
+        this.motionSearchRange = MOTION_SEARCH_RANGE_DEFAULT;
     }
 
     public int getKeyInterval() {
@@ -87,7 +90,15 @@ public class H264Encoder extends VideoEncoder {
     public void setKeyInterval(int keyInterval) {
         this.keyInterval = keyInterval;
     }
-    
+
+    public int getMotionSearchRange() {
+        return motionSearchRange;
+    }
+
+    public void setMotionSearchRange(int motionSearchRange) {
+        this.motionSearchRange = motionSearchRange;
+    }
+
     /**
      * Encode this picture into h.264 frame. Frame type will be selected by
      * encoder.
@@ -136,6 +147,9 @@ public class H264Encoder extends VideoEncoder {
 
     public ByteBuffer doEncodeFrame(Picture pic, ByteBuffer _out, boolean idr, int frameNumber, SliceType frameType) {
         ByteBuffer dup = _out.duplicate();
+        int maxSize = Math.min(dup.remaining(), pic.getWidth() * pic.getHeight());
+        maxSize -= (maxSize >>> 6); // 1.5% to account for escaping
+        int qp = rc.startPicture(pic.getSize(), maxSize, frameType);
 
         if (idr) {
             sps = initSPS(new Size(pic.getCroppedWidth(), pic.getCroppedHeight()));
@@ -167,7 +181,7 @@ public class H264Encoder extends VideoEncoder {
         for (int i = 0; i < mbWidth; i++)
             topEncoded[i] = new EncodedMB();
 
-        encodeSlice(sps, pps, pic, dup, idr, frameNumber, frameType);
+        encodeSlice(sps, pps, pic, dup, idr, frameNumber, frameType, qp);
 
         putLastMBLine();
 
@@ -193,7 +207,7 @@ public class H264Encoder extends VideoEncoder {
 
     public PictureParameterSet initPPS() {
         PictureParameterSet pps = new PictureParameterSet();
-        pps.picInitQpMinus26 = rc.getInitQp(SliceType.I) - 26;
+        pps.picInitQpMinus26 = 0; // start with qp = 26
         return pps;
     }
 
@@ -204,6 +218,7 @@ public class H264Encoder extends VideoEncoder {
         sps.chromaFormatIdc = ColorSpace.YUV420J;
         sps.profileIdc = 66;
         sps.levelIdc = 40;
+        sps.numRefFrames = 1;
         sps.frameMbsOnlyFlag = true;
         sps.log2MaxFrameNumMinus4 = Math.max(0, MathUtil.log2(keyInterval) - 3);
 
@@ -217,17 +232,14 @@ public class H264Encoder extends VideoEncoder {
     }
 
     private void encodeSlice(SeqParameterSet sps, PictureParameterSet pps, Picture pic, ByteBuffer dup, boolean idr,
-            int frameNum, SliceType sliceType) {
+            int frameNum, SliceType sliceType, int qp) {
         if (idr && sliceType != SliceType.I) {
             idr = false;
             Logger.warn("Illegal value of idr = true when sliceType != I");
         }
         cavlc = new CAVLC[] { new CAVLC(sps, pps, 2, 2), new CAVLC(sps, pps, 1, 1), new CAVLC(sps, pps, 1, 1) };
         mbEncoderI16x16 = new MBEncoderI16x16(cavlc, leftRow, topLine);
-        mbEncoderP16x16 = new MBEncoderP16x16(sps, ref, cavlc, new MotionEstimator(16));
-
-        rc.reset();
-        int qp = rc.getInitQp(sliceType);
+        mbEncoderP16x16 = new MBEncoderP16x16(sps, ref, cavlc, new MotionEstimator(motionSearchRange));
 
         dup.putInt(0x1);
         new NALUnit(idr ? NALUnitType.IDR_SLICE : NALUnitType.NON_IDR_SLICE, 3).write(dup);
@@ -245,12 +257,12 @@ public class H264Encoder extends VideoEncoder {
         BitWriter sliceData = new BitWriter(buf);
         new SliceHeaderWriter().write(sh, idr, 2, sliceData);
 
-        for (int mbY = 0; mbY < sps.picHeightInMapUnitsMinus1 + 1; mbY++) {
-            for (int mbX = 0; mbX < sps.picWidthInMbsMinus1 + 1; mbX++) {
+        for (int mbY = 0, mbAddr = 0; mbY < sps.picHeightInMapUnitsMinus1 + 1; mbY++) {
+            for (int mbX = 0; mbX < sps.picWidthInMbsMinus1 + 1; mbX++, mbAddr++) {
                 if (sliceType == SliceType.P) {
                     CAVLCWriter.writeUE(sliceData, 0); // number of skipped mbs
                 }
-
+                
                 MBType mbType = selectMBType(sliceType);
 
                 if (mbType == MBType.I_16x16) {
@@ -272,14 +284,18 @@ public class H264Encoder extends VideoEncoder {
                 }
 
                 BitWriter candidate;
-                int qpDelta;
+                int totalQpDelta = 0;
+                int qpDelta = rc.initialQpDelta();
                 do {
                     candidate = sliceData.fork();
-                    qpDelta = rc.getQpDelta();
-                    encodeMacroblock(mbType, pic, mbX, mbY, candidate, qp, qpDelta);
-                } while (!rc.accept(candidate.position() - sliceData.position()));
+                    totalQpDelta += qpDelta;
+                    encodeMacroblock(mbType, pic, mbX, mbY, candidate, qp, totalQpDelta);
+                    qpDelta = rc.accept(candidate.position() - sliceData.position());
+                    if (qpDelta != 0)
+                        restoreMacroblock(mbType);
+                } while (qpDelta != 0);
                 sliceData = candidate;
-                qp += qpDelta;
+                qp += totalQpDelta;
 
                 collectPredictors(outMB.getPixels(), mbX);
                 addToReference(mbX, mbY);
@@ -294,16 +310,27 @@ public class H264Encoder extends VideoEncoder {
     }
 
     private void encodeMacroblock(MBType mbType, Picture pic, int mbX, int mbY, BitWriter candidate, int qp, int qpDelta) {
-        if (mbType == MBType.I_16x16)
+        if (mbType == MBType.I_16x16) {
+            mbEncoderI16x16.save();
             mbEncoderI16x16.encodeMacroblock(pic, mbX, mbY, candidate, outMB, mbX > 0 ? topEncoded[mbX - 1] : null,
                     mbY > 0 ? topEncoded[mbX] : null, qp + qpDelta, qpDelta);
-        else if (mbType == MBType.P_16x16)
+        } else if (mbType == MBType.P_16x16) {
+            mbEncoderP16x16.save();
             mbEncoderP16x16.encodeMacroblock(pic, mbX, mbY, candidate, outMB, mbX > 0 ? topEncoded[mbX - 1] : null,
                     mbY > 0 ? topEncoded[mbX] : null, qp + qpDelta, qpDelta);
-        else
+        } else
             throw new RuntimeException("Macroblock of type " + mbType + " is not supported.");
     }
-
+    
+    private void restoreMacroblock(MBType mbType) {
+        if (mbType == MBType.I_16x16) {
+            mbEncoderI16x16.restore();
+        } else if (mbType == MBType.P_16x16) {
+            mbEncoderP16x16.restore();
+        } else
+            throw new RuntimeException("Macroblock of type " + mbType + " is not supported.");
+    }
+    
     private MBType selectMBType(SliceType sliceType) {
         if (sliceType == SliceType.I)
             return MBType.I_16x16;

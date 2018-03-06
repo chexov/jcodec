@@ -156,4 +156,42 @@ public class H264UtilsTest {
         Assert.assertEquals(0, pair.mv1Y(1, 1));
         Assert.assertEquals(-1, pair.mv1R(1, 1));
     }
+
+    @Test
+    public void testGotoNALUnit() {
+        ByteBuffer buf = ByteBuffer.wrap(new byte[]{
+                0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x65,
+                0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x01, 0x65,
+                0x00, 0x00, 0x01, 0x42, 0x00, 0x00, 0x03, 0x00, 0x49 });
+        ByteBuffer bufA = buf.duplicate();
+
+        byte[] res0 = NIOUtils.toArray(H264Utils.gotoNALUnit(buf));
+        byte[] res0A = NIOUtils.toArray(H264Utils.gotoNALUnitWithArray(bufA));
+
+        buf.position(buf.position() + 3);
+        bufA.position(bufA.position() + 3);
+        byte[] res1 = NIOUtils.toArray(H264Utils.gotoNALUnit(buf));
+        byte[] res1A = NIOUtils.toArray(H264Utils.gotoNALUnitWithArray(bufA));
+
+        buf.position(buf.position() + 4);
+        bufA.position(bufA.position() + 4);
+        byte[] res2 = NIOUtils.toArray(H264Utils.gotoNALUnit(buf));
+        byte[] res2A = NIOUtils.toArray(H264Utils.gotoNALUnitWithArray(bufA));
+
+        buf.position(buf.position() + 3);
+        bufA.position(bufA.position() + 3);
+        byte[] res3 = NIOUtils.toArray(H264Utils.gotoNALUnit(buf));
+        byte[] res3A = NIOUtils.toArray(H264Utils.gotoNALUnitWithArray(bufA));
+
+        Assert.assertArrayEquals(new byte[]{0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x65}, res0);
+        Assert.assertArrayEquals(new byte[]{}, res1);
+        Assert.assertArrayEquals(new byte[]{0x65}, res2);
+        Assert.assertArrayEquals(new byte[]{0x42, 0x00, 0x00, 0x03, 0x00, 0x49}, res3);
+
+        Assert.assertArrayEquals(res0, res0A);
+        Assert.assertArrayEquals(res1, res1A);
+        Assert.assertArrayEquals(res2, res2A);
+        Assert.assertArrayEquals(res3, res3A);
+    }
 }
